@@ -2,11 +2,11 @@ package main
 
 import "fmt"
 
-func hello() {
+func Hello() {
 	fmt.Println("hello")
 }
 
-func world() {
+func World() {
 	fmt.Println("world")
 }
 func main() {
