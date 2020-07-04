@@ -38,3 +38,44 @@ func timer2(i1, i2, i3 time.Duration) {
 		fmt.Println("Timed out")
 	}
 }
+func ticker1(internal time.Duration, stop time.Duration) {
+	t := time.NewTicker(internal)
+	s := time.NewTimer(stop)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.C:
+			fmt.Println("timout")
+			return
+		case <-t.C:
+			fmt.Println("hello world")
+		}
+	}
+}
+
+
+
+func ticker2(internal time.Duration, stop time.Duration) {
+	keep := true
+	c := time.After(stop)
+	s := make(chan int, 1)
+	go func() {
+		for i := 0; keep; i++ {
+			fmt.Println("hello world")
+			if i == 10 {
+				s <- i
+				return
+			}
+			time.Sleep(internal)
+		}
+		fmt.Println("fun over")
+	}()
+	select {
+	case <-c:
+		fmt.Println("timeout")
+		keep=false
+	case j := <-s:
+		fmt.Println("i reach to ", j)
+	}
+	time.Sleep(internal)
+}
