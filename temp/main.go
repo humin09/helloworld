@@ -51,6 +51,8 @@ func (o *orm) Page(page uint32, pageSize uint32) *orm {
 	o.limit = fmt.Sprintf("limit %d,%d", page*pageSize, page*(pageSize+1))
 	return o
 }
+
+//Condition support User{} &User{} map[string]interface{}, most field or kv will change to  where a=? and b=? while if field or key is slice will change to where a in (?,?,?)
 func (o *orm) Condition(condition interface{}) *orm {
 	if condition == nil {
 		o.err = errors.New("condition is nil")
@@ -61,11 +63,29 @@ func (o *orm) Condition(condition interface{}) *orm {
 		o.err = err
 		return o
 	}
+	o.where = ""
 	for i := 0; i < len(keys); i++ {
-		o.where = o.where + keys[i] + "=?,"
-		o.whereParams = append(o.whereParams, values[i])
+		v := reflect.ValueOf(values[i])
+		if v.Kind() == reflect.Slice {
+			l := v.Len()
+			if l == 0 {
+				continue
+			}
+			placeHolder := strings.Repeat("?,", l)
+			placeHolder = placeHolder[0 : len(placeHolder)-1]
+			keys[i] = keys[i] + fmt.Sprintf(" in (%s) ", placeHolder)
+			for j := 0; j < l; j++ {
+				o.whereParams = append(o.whereParams, v.Index(j).Interface())
+			}
+
+		} else {
+			keys[i] = keys[i] + " = ? "
+			o.whereParams = append(o.whereParams, values[i])
+		}
+
 	}
-	o.where = o.where[0 : len(o.where)-1]
+
+	o.where = strings.Join(keys, " and ")
 	return o
 }
 
@@ -97,7 +117,10 @@ func (o *orm) Select(ctx context.Context, dest interface{}) (err error) {
 
 func (o *orm) selectSingle(ctx context.Context, v reflect.Value) (err error) {
 	o.limit = "limit 1"
-	columns, address := ColumnAndAddress(v)
+	columns, address, err := ColumnAndAddress(v)
+	if err != nil {
+		return err
+	}
 	if columns == nil || len(columns) == 0 {
 		err = errors.New("parse empty columns")
 		return err
@@ -108,7 +131,7 @@ func (o *orm) selectSingle(ctx context.Context, v reflect.Value) (err error) {
 	}
 	sqlStr := fmt.Sprintf(SelectTemplate, strings.Join(columns, Delimiter), o.table, o.where, o.order, o.limit)
 	fmt.Println(sqlStr)
-	err = o.db.QueryRowContext(ctx, sqlStr, o.whereParams...).Scan(address)
+	err = o.db.QueryRowContext(ctx, sqlStr, o.whereParams...).Scan(address...)
 	return err
 }
 func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
@@ -116,7 +139,10 @@ func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
 	ct := v.Type().Elem()
 	//创建一个空的struct
 	cv := reflect.New(ct)
-	columns, _ := ColumnAndAddress(cv)
+	columns, _, err := ColumnAndAddress(cv)
+	if err != nil {
+		return err
+	}
 	if columns == nil || len(columns) == 0 {
 		err = errors.New("parse empty columns")
 		return err
@@ -131,7 +157,10 @@ func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
 	newArr := make([]reflect.Value, 0)
 	for rows.Next() {
 		temp := reflect.New(ct)
-		_, tempAddress := ColumnAndAddress(temp)
+		_, tempAddress, err := ColumnAndAddress(temp)
+		if err != nil {
+			return err
+		}
 		err = rows.Scan(tempAddress...)
 		if err != nil {
 			return err
@@ -214,10 +243,6 @@ func (o *orm) Insert(ctx context.Context, obj interface{}) (id int64, err error)
 //Update in can be User, *User, map[string]interface{}, return
 func (o *orm) Update(ctx context.Context, obj interface{}) (rowsAffected int64, err error) {
 	v := reflect.ValueOf(obj)
-	//剥离指针
-	for v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
 	keys, values, err := GetKV(v)
 	if err != nil {
 		return 0, err
@@ -250,46 +275,57 @@ func (o *orm) Delete(ctx context.Context) (id int64, err error) {
 	id, err = result.RowsAffected()
 	return
 }
-func ColumnAndAddress(v reflect.Value) (columns []string, address []interface{}) {
-	fmt.Println(v)
-	dest := v.Elem()
-	fmt.Println(dest)
-	t := dest.Type()
+
+//ColumnAndAddress 给定一个*User, 返回他的所有可访问的Field和其成员的指针,
+func ColumnAndAddress(v reflect.Value) (columns []string, address []interface{}, err error) {
+	if v.Kind() != reflect.Ptr {
+		err = errors.New("only support pointer type")
+	}
+	//去掉指针
+	v = v.Elem()
+	t := v.Type()
 	columns = make([]string, 0)
 	address = make([]interface{}, 0)
 	for n := 0; n < t.NumField(); n++ {
 		tf := t.Field(n)
-		vf := dest.Field(n)
+		vf := v.Field(n)
 		if tf.Anonymous {
 			continue
 		}
-		fmt.Println(tf)
-		fmt.Println(vf)
 		for vf.Type().Kind() == reflect.Ptr {
 			vf = vf.Elem()
 		}
-		fmt.Println(v)
-		address = append(address, vf.Addr().Interface())
-		columns = append(columns, tf.Name)
+		if vf.CanAddr() && vf.Addr().CanInterface() {
+			address = append(address, vf.Addr().Interface())
+			//优先使用tag
+			key := tf.Tag.Get(ColumnTag)
+			//没有根据变量名转小写snake
+			if key == "" {
+				key = strings.ToLower(ToSnake(tf.Name))
+			}
+			columns = append(columns, key)
+		}
 	}
 	return
 }
 
+//GetKV 可以输入User,*User, Map, *Map, 会拿取里面的值不为空的Field/Key和Value, 并且把Key从驼峰转下划线即: AngelaBaby转为angela_baby
 func GetKV(v reflect.Value) (keys []string, values []interface{}, err error) {
+	//剥离指针
+	for v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
 	t := v.Type()
 	switch t.Kind() {
 	case reflect.Struct:
 		keys, values = struct2KV(v)
 		return
 	case reflect.Map:
-		mapKeys := v.MapKeys()
-		for _, key := range mapKeys {
-			value := v.MapIndex(key)
-			if !value.IsValid() || reflect.DeepEqual(value.Interface(), reflect.Zero(value.Type()).Interface()) {
-				continue
-			}
+		m := v.Interface().(map[string]interface{})
+		for key, value := range m {
+			key = strings.ToLower(ToSnake(key))
+			keys = append(keys, key)
 			values = append(values, value)
-			keys = append(keys, key.Interface().(string))
 		}
 		return
 	default:
@@ -440,9 +476,27 @@ func main() {
 		return
 	}
 	env := &Env{}
-	err = InitOrm(db, "qbase_env").Select(ctx, env)
+	o := InitOrm(db, "qbase_env")
+	err = o.Select(ctx, env)
 	if err != nil {
 		fmt.Println(err.Error())
 		return
 	}
+	fmt.Printf("query1 env success, %v\n", *env)
+	err = o.Condition(map[string]interface{}{
+		"Id":     1874,
+		"Region": "ap-shanghai",
+	}).Select(ctx, env)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("query2 env success, %v\n", *env)
+
+	err = o.Condition(struct{ Id int }{1874}).Select(ctx, env)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("query3 env success, %v\n", *env)
 }
