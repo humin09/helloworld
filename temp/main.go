@@ -31,11 +31,10 @@ type orm struct {
 
 func InitOrm(db *sql.DB, table string) *orm {
 	o := &orm{
-		db:          db,
-		table:       table,
-		where:       "1=1",
-		whereParams: make([]interface{}, 0),
+		db:    db,
+		table: table,
 	}
+	o.reset()
 	return o
 }
 
@@ -47,8 +46,8 @@ func (o *orm) Limit(limit uint32) *orm {
 	o.limit = fmt.Sprintf("limit %d", limit)
 	return o
 }
-func (o *orm) Page(page uint32, pageSize uint32) *orm {
-	o.limit = fmt.Sprintf("limit %d,%d", page*pageSize, page*(pageSize+1))
+func (o *orm) Page(pageNo uint32, pageSize uint32) *orm {
+	o.limit = fmt.Sprintf("limit %d,%d", pageNo*pageSize, (pageNo+1)*pageSize)
 	return o
 }
 
@@ -59,6 +58,8 @@ func (o *orm) Condition(condition interface{}) *orm {
 		return o
 	}
 	keys, values, err := GetKV(reflect.ValueOf(condition))
+	fmt.Println(keys)
+	fmt.Println(values)
 	if err != nil {
 		o.err = err
 		return o
@@ -77,20 +78,23 @@ func (o *orm) Condition(condition interface{}) *orm {
 			for j := 0; j < l; j++ {
 				o.whereParams = append(o.whereParams, v.Index(j).Interface())
 			}
-
 		} else {
 			keys[i] = keys[i] + " = ? "
 			o.whereParams = append(o.whereParams, values[i])
 		}
-
 	}
-
+	fmt.Println(o.whereParams)
 	o.where = strings.Join(keys, " and ")
 	return o
+}
+func (o *orm) reset() {
+	o.whereParams = make([]interface{}, 0)
+	o.where = "1=1"
 }
 
 //Select dest must be a ptr, e.g. *user, *[]user
 func (o *orm) Select(ctx context.Context, dest interface{}) (err error) {
+	defer o.reset()
 	if o.err != nil {
 		return o.err
 	}
@@ -136,7 +140,7 @@ func (o *orm) selectSingle(ctx context.Context, v reflect.Value) (err error) {
 }
 func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
 	//每个数组成员的类型
-	ct := v.Type().Elem()
+	ct := v.Type().Elem().Elem()
 	//创建一个空的struct
 	cv := reflect.New(ct)
 	columns, _, err := ColumnAndAddress(cv)
@@ -175,6 +179,7 @@ func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
 
 //Insert in can be User, *User, []User, []*User, map[string]interface{}, returns lastId
 func (o *orm) Insert(ctx context.Context, obj interface{}) (id int64, err error) {
+	defer o.reset()
 	v := reflect.ValueOf(obj)
 	//剥离指针
 	for v.Kind() == reflect.Ptr {
@@ -242,6 +247,7 @@ func (o *orm) Insert(ctx context.Context, obj interface{}) (id int64, err error)
 
 //Update in can be User, *User, map[string]interface{}, return
 func (o *orm) Update(ctx context.Context, obj interface{}) (rowsAffected int64, err error) {
+	defer o.reset()
 	v := reflect.ValueOf(obj)
 	keys, values, err := GetKV(v)
 	if err != nil {
@@ -266,6 +272,7 @@ func (o *orm) Update(ctx context.Context, obj interface{}) (rowsAffected int64, 
 
 //Delete, return rows affected
 func (o *orm) Delete(ctx context.Context) (id int64, err error) {
+	defer o.reset()
 	query := fmt.Sprintf(DeleteTemplate, o.table, o.where)
 	fmt.Printf("delete sql: %s \n", query)
 	result, err := o.db.ExecContext(ctx, query, o.whereParams...)
@@ -278,11 +285,10 @@ func (o *orm) Delete(ctx context.Context) (id int64, err error) {
 
 //ColumnAndAddress 给定一个*User, 返回他的所有可访问的Field和其成员的指针,
 func ColumnAndAddress(v reflect.Value) (columns []string, address []interface{}, err error) {
-	if v.Kind() != reflect.Ptr {
-		err = errors.New("only support pointer type")
-	}
 	//去掉指针
-	v = v.Elem()
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
 	t := v.Type()
 	columns = make([]string, 0)
 	address = make([]interface{}, 0)
@@ -499,4 +505,9 @@ func main() {
 		return
 	}
 	fmt.Printf("query3 env success, %v\n", *env)
+	envs := make([]Env, 0)
+	err = o.Condition(map[string]interface{}{
+		"Region": "ap-shanghai",
+	}).Page(0, 10).Order("order by id desc").Select(ctx, &envs)
+	fmt.Printf("query4 env success, %v\n", envs)
 }
