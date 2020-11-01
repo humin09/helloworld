@@ -21,6 +21,7 @@ const DeleteTemplate = "delete from %s where %s"
 
 type orm struct {
 	db          *sql.DB
+	tx          *sql.Tx
 	table       string
 	order       string
 	limit       string
@@ -38,6 +39,10 @@ func InitOrm(db *sql.DB, table string) *orm {
 	return o
 }
 
+func (o *orm) Tx(tx *sql.Tx) *orm {
+	o.tx = tx
+	return o
+}
 func (o *orm) Order(orderBy string) *orm {
 	o.order = orderBy
 	return o
@@ -58,8 +63,6 @@ func (o *orm) Condition(condition interface{}) *orm {
 		return o
 	}
 	keys, values, err := GetKV(reflect.ValueOf(condition))
-	fmt.Println(keys)
-	fmt.Println(values)
 	if err != nil {
 		o.err = err
 		return o
@@ -83,7 +86,6 @@ func (o *orm) Condition(condition interface{}) *orm {
 			o.whereParams = append(o.whereParams, values[i])
 		}
 	}
-	fmt.Println(o.whereParams)
 	o.where = strings.Join(keys, " and ")
 	return o
 }
@@ -121,6 +123,12 @@ func (o *orm) Select(ctx context.Context, dest interface{}) (err error) {
 
 func (o *orm) selectSingle(ctx context.Context, v reflect.Value) (err error) {
 	o.limit = "limit 1"
+	if v.Kind() != reflect.Struct {
+		err = errors.New("selectSingle only support *User")
+	}
+	if !v.CanSet() {
+		err = errors.New(fmt.Sprintf("selectSingle reflect value %v can't set", v))
+	}
 	columns, address, err := ColumnAndAddress(v)
 	if err != nil {
 		return err
@@ -133,14 +141,26 @@ func (o *orm) selectSingle(ctx context.Context, v reflect.Value) (err error) {
 		err = errors.New("parse empty address")
 		return err
 	}
-	sqlStr := fmt.Sprintf(SelectTemplate, strings.Join(columns, Delimiter), o.table, o.where, o.order, o.limit)
-	fmt.Println(sqlStr)
-	err = o.db.QueryRowContext(ctx, sqlStr, o.whereParams...).Scan(address...)
+	query := fmt.Sprintf(SelectTemplate, strings.Join(columns, Delimiter), o.table, o.where, o.order, o.limit)
+	if o.tx == nil {
+		query = query + "for update"
+		fmt.Printf("sql: %s", query)
+		err = o.db.QueryRowContext(ctx, query, o.whereParams...).Scan(address...)
+	} else {
+		fmt.Printf("sql: %s", query)
+		err = o.tx.QueryRowContext(ctx, query, o.whereParams...).Scan(address...)
+	}
 	return err
 }
 func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
+	if !v.CanSet() {
+		err = errors.New(fmt.Sprintf("selectMultiple reflect value %v can't set", v))
+	}
 	//每个数组成员的类型
 	ct := v.Type().Elem().Elem()
+	if ct.Kind() != reflect.Struct {
+		err = errors.New("selectMultiple only support *[]User, not *[]*User")
+	}
 	//创建一个空的struct
 	cv := reflect.New(ct)
 	columns, _, err := ColumnAndAddress(cv)
@@ -151,16 +171,24 @@ func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
 		err = errors.New("parse empty columns")
 		return err
 	}
-	sqlStr := fmt.Sprintf(SelectTemplate, strings.Join(columns, Delimiter), o.table, o.where, o.order, o.limit)
-	fmt.Println(sqlStr)
-	rows, err := o.db.QueryContext(ctx, sqlStr, o.whereParams...)
+	query := fmt.Sprintf(SelectTemplate, strings.Join(columns, Delimiter), o.table, o.where, o.order, o.limit)
+
+	var rows *sql.Rows
+	if o.tx == nil {
+		fmt.Printf("sql: %s", query)
+		rows, err = o.db.QueryContext(ctx, query, o.whereParams...)
+	} else {
+		query = query + "for update"
+		fmt.Printf("sql: %s", query)
+		rows, err = o.tx.QueryContext(ctx, query, o.whereParams...)
+	}
 	if err != nil {
 		return err
 	}
 	// 创建一个新数组并把元素的值追加进去
 	newArr := make([]reflect.Value, 0)
 	for rows.Next() {
-		temp := reflect.New(ct)
+		temp := reflect.New(ct).Elem()
 		_, tempAddress, err := ColumnAndAddress(temp)
 		if err != nil {
 			return err
@@ -172,8 +200,8 @@ func (o *orm) selectMultiple(ctx context.Context, v reflect.Value) (err error) {
 		newArr = append(newArr, temp)
 	}
 	//和旧的生成一个新的
-	resArr := reflect.Append(v, newArr...)
-	v.Set(resArr)
+	resArr := reflect.Append(v.Elem(), newArr...)
+	v.Elem().Set(resArr)
 	return nil
 }
 
@@ -236,8 +264,14 @@ func (o *orm) Insert(ctx context.Context, obj interface{}) (id int64, err error)
 		valueStr = valueStr[0 : len(s1)-1]
 	}
 	query := fmt.Sprintf(InsertTemplate, o.table, strings.Join(keys, ","), valueStr)
-	fmt.Printf("insert query: %s", query)
-	result, err := o.db.ExecContext(ctx, query, values...)
+	fmt.Printf("sql: %s", query)
+	var result sql.Result
+	if o.tx == nil {
+		result, err = o.db.ExecContext(ctx, query, values...)
+	} else {
+		result, err = o.tx.ExecContext(ctx, query, values...)
+	}
+
 	if err != nil {
 		return 0, err
 	}
@@ -258,11 +292,16 @@ func (o *orm) Update(ctx context.Context, obj interface{}) (rowsAffected int64, 
 		return 0, err
 	}
 	setStr := strings.Join(keys, "=?,")
-	setStr = setStr[0 : len(setStr)-1]
+	setStr = setStr + "=?"
 	query := fmt.Sprintf(UpdateTemplate, o.table, setStr, o.where)
-	fmt.Printf("insert query: %s", query)
+	fmt.Printf("sql: %s", query)
 	values = append(values, o.whereParams...)
-	result, err := o.db.ExecContext(ctx, query, values...)
+	var result sql.Result
+	if o.tx == nil {
+		result, err = o.db.ExecContext(ctx, query, values...)
+	} else {
+		result, err = o.tx.ExecContext(ctx, query, values...)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -274,8 +313,13 @@ func (o *orm) Update(ctx context.Context, obj interface{}) (rowsAffected int64, 
 func (o *orm) Delete(ctx context.Context) (id int64, err error) {
 	defer o.reset()
 	query := fmt.Sprintf(DeleteTemplate, o.table, o.where)
-	fmt.Printf("delete sql: %s \n", query)
-	result, err := o.db.ExecContext(ctx, query, o.whereParams...)
+	fmt.Printf("sql: %s", query)
+	var result sql.Result
+	if o.tx == nil {
+		result, err = o.db.ExecContext(ctx, query, o.whereParams...)
+	} else {
+		result, err = o.tx.ExecContext(ctx, query, o.whereParams...)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -295,7 +339,8 @@ func ColumnAndAddress(v reflect.Value) (columns []string, address []interface{},
 	for n := 0; n < t.NumField(); n++ {
 		tf := t.Field(n)
 		vf := v.Field(n)
-		if tf.Anonymous {
+		//忽略非导出字段
+		if tf.Anonymous || !vf.CanInterface() {
 			continue
 		}
 		for vf.Type().Kind() == reflect.Ptr {
@@ -346,7 +391,7 @@ func struct2KV(v reflect.Value) (keys []string, values []interface{}) {
 		tf := t.Field(n)
 		vf := v.Field(n)
 		//忽略非导出字段
-		if tf.Anonymous {
+		if tf.Anonymous || !vf.CanInterface() {
 			continue
 		}
 		//忽略无效、零值字段
@@ -448,8 +493,27 @@ func ToScreamingDelimited(s string, delimiter uint8, ignore uint8, screaming boo
 			n.WriteByte(v)
 		}
 	}
-
 	return n.String()
+}
+
+//运行事务
+func RunTx(ctx context.Context, db *sql.DB, dbFunc func(*sql.Tx) error) error {
+	tx, errTx := db.BeginTx(ctx, nil)
+	if errTx != nil {
+		return fmt.Errorf("db transaction begin fail")
+	}
+
+	err := dbFunc(tx)
+	if err != nil {
+		errTx = tx.Rollback()
+		if errTx != nil {
+			return fmt.Errorf("db transaction rollback fail")
+		}
+		return err
+	} else {
+		err = tx.Commit()
+	}
+	return err
 }
 
 func AddAlias(columns []string, alias string) []string {
@@ -469,7 +533,7 @@ type Env struct {
 	Id         uint32
 	EnvId      string
 	Region     string
-	status     uint32
+	Status     uint32
 	CreateTime string
 	UpdateTime string
 }
@@ -509,5 +573,54 @@ func main() {
 	err = o.Condition(map[string]interface{}{
 		"Region": "ap-shanghai",
 	}).Page(0, 10).Order("order by id desc").Select(ctx, &envs)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
 	fmt.Printf("query4 env success, %v\n", envs)
+
+	envs = make([]Env, 0)
+	err = o.Condition(map[string]interface{}{
+		"Id":     []int{1874, 1878},
+		"Region": "ap-shanghai",
+	}).Page(0, 10).Order("order by id desc").Select(ctx, &envs)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("query5 env success, %v\n", envs)
+
+	id, err := o.Insert(ctx, Env{
+		EnvId:  "helloworld",
+		Region: "huoxin",
+	})
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("insert env success,id is %v\n", id)
+
+	affectRows, err := o.Condition(Env{
+		EnvId:  "helloworld",
+		Region: "huoxin",
+	}).Update(ctx, Env{
+		Status: 1,
+		Region: "huoxin",
+	})
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("update env success,affectRows is %v\n", affectRows)
+
+	affectRows, err = o.Condition(Env{
+		EnvId:  "helloworld",
+		Region: "huoxin",
+	}).Delete(ctx)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("delete env success,affectRows is %v\n", affectRows)
+
 }
